@@ -218,9 +218,12 @@ class ExperimentRun:
         constraints_filepath.strip()
         constraints = set()
 
+        if not os.path.exists(constraints_filepath):
+            raise ValueError("The file '%s' does not exist." % constraints_filepath)
+
         with codecs.open(constraints_filepath, "r", "utf-8") as f:
             for line in f:
-                word_pair = line.split()
+                word_pair = line.replace("en_", "").split()
                 if word_pair[0] in self.vocabulary and word_pair[1] in self.vocabulary and word_pair[0] != word_pair[1]:
                     constraints |= {(self.vocab_index[word_pair[0]], self.vocab_index[word_pair[1]])}
 
@@ -352,8 +355,8 @@ class ExperimentRun:
             antonym_counter = 0
             synonym_counter = 0
 
-            order_of_synonyms = range(0, self.syn_count)
-            order_of_antonyms = range(0, self.ant_count)
+            order_of_synonyms = list(range(0, self.syn_count))
+            order_of_antonyms = list(range(0, self.ant_count))
 
             random.shuffle(order_of_synonyms)
             random.shuffle(order_of_antonyms)
