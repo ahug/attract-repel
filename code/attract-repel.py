@@ -2,7 +2,7 @@ import configparser
 import numpy
 import sys
 import time
-import random 
+import random
 import math
 import os
 from copy import deepcopy
@@ -13,6 +13,7 @@ import codecs
 from scipy.stats import spearmanr
 import tensorflow as tf
 import traceback
+import hypeval
 
 from scipy.spatial.distance import pdist
 from scipy.spatial.distance import squareform
@@ -22,6 +23,7 @@ class ExperimentRun:
     """
     This class stores all of the data and hyperparameters required for an Attract-Repel run. 
     """
+
 
     def __init__(self, config_filepath):
         """
@@ -40,6 +42,9 @@ class ExperimentRun:
             print("Couldn't read config file from", config_filepath)
             return None
 
+        self.evaluate_hypernymy = self.config.getboolean("experiment", "evaluate_hypernymy")
+        self.hypernymy_dataset_path = self.config.get("experiment", "hypernymy_dataset_path")
+
         distributional_vectors_filepath = self.config.get("data", "distributional_vectors")
 
         try:
@@ -49,7 +54,7 @@ class ExperimentRun:
 
         # load initial distributional word vectors. 
         distributional_vectors = load_word_vectors(distributional_vectors_filepath)
-        
+
         if not distributional_vectors:
             return
 
@@ -67,8 +72,8 @@ class ExperimentRun:
             self.inverted_index[idx] = word
 
         # load list of filenames for synonyms and antonyms. 
-        synonym_list = self.config.get("data", "synonyms").replace("[","").replace("]", "").replace(" ", "").split(",")
-        antonym_list = self.config.get("data", "antonyms").replace("[","").replace("]", "").replace(" ", "").split(",")
+        synonym_list = self.config.get("data", "synonyms").replace("[", "").replace("]", "").replace(" ", "").split(",")
+        antonym_list = self.config.get("data", "antonyms").replace("[", "").replace("]", "").replace(" ", "").split(",")
 
         self.synonyms = set()
         self.antonyms = set()
@@ -102,7 +107,7 @@ class ExperimentRun:
 
         # load the handles so that we can load current state of vectors from the Tensorflow embedding. 
         embedding_handles = self.initialise_model(numpy_embedding)
-        
+
         self.embedding_attract_left = embedding_handles[0]
         self.embedding_attract_right = embedding_handles[1]
         self.embedding_repel_left = embedding_handles[2]
@@ -118,8 +123,8 @@ class ExperimentRun:
         """
         Initialises the TensorFlow Attract-Repel model.
         """
-        self.attract_examples = tf.placeholder(tf.int32, [None, 2]) # each element is the position of word vector. 
-        self.repel_examples = tf.placeholder(tf.int32, [None, 2]) # each element is again the position of word vector.
+        self.attract_examples = tf.placeholder(tf.int32, [None, 2])  # each element is the position of word vector.
+        self.repel_examples = tf.placeholder(tf.int32, [None, 2])  # each element is again the position of word vector.
 
         self.negative_examples_attract = tf.placeholder(tf.int32, [None, 2])
         self.negative_examples_repel = tf.placeholder(tf.int32, [None, 2])
@@ -127,58 +132,73 @@ class ExperimentRun:
         self.attract_margin = tf.placeholder("float")
         self.repel_margin = tf.placeholder("float")
         self.regularisation_constant = tf.placeholder("float")
-        
+
         # Initial (distributional) vectors. Needed for L2 regularisation.         
         self.W_init = tf.constant(numpy_embedding, name="W_init")
 
         # Variable storing the updated word vectors. 
         self.W_dynamic = tf.Variable(numpy_embedding, name="W_dynamic")
 
-
-        # Attract Cost Function: 
+        # Attract Cost Function:
 
         # placeholders for example pairs...
-        attract_examples_left = tf.nn.l2_normalize(tf.nn.embedding_lookup(self.W_dynamic, self.attract_examples[:, 0]), 1) 
-        attract_examples_right = tf.nn.l2_normalize(tf.nn.embedding_lookup(self.W_dynamic, self.attract_examples[:, 1]), 1)
+        attract_examples_left = tf.nn.l2_normalize(tf.nn.embedding_lookup(self.W_dynamic, self.attract_examples[:, 0]),
+                                                   1)
+        attract_examples_right = tf.nn.l2_normalize(tf.nn.embedding_lookup(self.W_dynamic, self.attract_examples[:, 1]),
+                                                    1)
 
         # and their respective negative examples:
-        negative_examples_attract_left = tf.nn.l2_normalize(tf.nn.embedding_lookup(self.W_dynamic, self.negative_examples_attract[:, 0]), 1)
-        negative_examples_attract_right = tf.nn.l2_normalize(tf.nn.embedding_lookup(self.W_dynamic, self.negative_examples_attract[:, 1]), 1)
+        negative_examples_attract_left = tf.nn.l2_normalize(
+            tf.nn.embedding_lookup(self.W_dynamic, self.negative_examples_attract[:, 0]), 1)
+        negative_examples_attract_right = tf.nn.l2_normalize(
+            tf.nn.embedding_lookup(self.W_dynamic, self.negative_examples_attract[:, 1]), 1)
 
         # dot product between the example pairs. 
-        attract_similarity_between_examples = tf.reduce_sum(tf.multiply(attract_examples_left, attract_examples_right), 1) 
+        attract_similarity_between_examples = tf.reduce_sum(tf.multiply(attract_examples_left, attract_examples_right),
+                                                            1)
 
         # dot product of each word in the example with its negative example. 
-        attract_similarity_to_negatives_left = tf.reduce_sum(tf.multiply(attract_examples_left, negative_examples_attract_left), 1) 
-        attract_similarity_to_negatives_right = tf.reduce_sum(tf.multiply(attract_examples_right, negative_examples_attract_right), 1)
+        attract_similarity_to_negatives_left = tf.reduce_sum(
+            tf.multiply(attract_examples_left, negative_examples_attract_left), 1)
+        attract_similarity_to_negatives_right = tf.reduce_sum(
+            tf.multiply(attract_examples_right, negative_examples_attract_right), 1)
 
         # and the final Attract Cost Function (sans regularisation):
-        self.attract_cost = tf.nn.relu(self.attract_margin + attract_similarity_to_negatives_left - attract_similarity_between_examples) + \
-                       tf.nn.relu(self.attract_margin + attract_similarity_to_negatives_right - attract_similarity_between_examples)
+        self.attract_cost = tf.nn.relu(
+            self.attract_margin + attract_similarity_to_negatives_left - attract_similarity_between_examples) + \
+                            tf.nn.relu(
+                                self.attract_margin + attract_similarity_to_negatives_right - attract_similarity_between_examples)
 
         # Repel Cost Function: 
 
         # placeholders for example pairs...
-        repel_examples_left = tf.nn.l2_normalize(tf.nn.embedding_lookup(self.W_dynamic, self.repel_examples[:, 0]), 1) # becomes batch_size X vector_dimension 
+        repel_examples_left = tf.nn.l2_normalize(tf.nn.embedding_lookup(self.W_dynamic, self.repel_examples[:, 0]),
+                                                 1)  # becomes batch_size X vector_dimension
         repel_examples_right = tf.nn.l2_normalize(tf.nn.embedding_lookup(self.W_dynamic, self.repel_examples[:, 1]), 1)
 
         # and their respective negative examples:
-        negative_examples_repel_left  = tf.nn.l2_normalize(tf.nn.embedding_lookup(self.W_dynamic, self.negative_examples_repel[:, 0]), 1)
-        negative_examples_repel_right = tf.nn.l2_normalize(tf.nn.embedding_lookup(self.W_dynamic, self.negative_examples_repel[:, 1]), 1)
+        negative_examples_repel_left = tf.nn.l2_normalize(
+            tf.nn.embedding_lookup(self.W_dynamic, self.negative_examples_repel[:, 0]), 1)
+        negative_examples_repel_right = tf.nn.l2_normalize(
+            tf.nn.embedding_lookup(self.W_dynamic, self.negative_examples_repel[:, 1]), 1)
 
         # dot product between the example pairs. 
-        repel_similarity_between_examples = tf.reduce_sum(tf.multiply(repel_examples_left, repel_examples_right), 1) # becomes batch_size again, might need tf.squeeze
+        repel_similarity_between_examples = tf.reduce_sum(tf.multiply(repel_examples_left, repel_examples_right),
+                                                          1)  # becomes batch_size again, might need tf.squeeze
 
         # dot product of each word in the example with its negative example. 
-        repel_similarity_to_negatives_left = tf.reduce_sum(tf.multiply(repel_examples_left, negative_examples_repel_left), 1)
-        repel_similarity_to_negatives_right = tf.reduce_sum(tf.multiply(repel_examples_right, negative_examples_repel_right), 1)
+        repel_similarity_to_negatives_left = tf.reduce_sum(
+            tf.multiply(repel_examples_left, negative_examples_repel_left), 1)
+        repel_similarity_to_negatives_right = tf.reduce_sum(
+            tf.multiply(repel_examples_right, negative_examples_repel_right), 1)
 
         # and the final Repel Cost Function (sans regularisation):
-        self.repel_cost = tf.nn.relu(self.repel_margin - repel_similarity_to_negatives_left + repel_similarity_between_examples) + \
-                       tf.nn.relu(self.repel_margin - repel_similarity_to_negatives_right + repel_similarity_between_examples)
+        self.repel_cost = tf.nn.relu(
+            self.repel_margin - repel_similarity_to_negatives_left + repel_similarity_between_examples) + \
+                          tf.nn.relu(
+                              self.repel_margin - repel_similarity_to_negatives_right + repel_similarity_between_examples)
 
-
-        # The Regularisation Cost (separate for the two terms, depending on which one is called): 
+        # The Regularisation Cost (separate for the two terms, depending on which one is called):
 
         # load the original distributional vectors for the example pairs: 
         original_attract_examples_left = tf.nn.embedding_lookup(self.W_init, self.attract_examples[:, 0])
@@ -188,21 +208,25 @@ class ExperimentRun:
         original_repel_examples_right = tf.nn.embedding_lookup(self.W_init, self.repel_examples[:, 1])
 
         # and then define the respective regularisation costs:
-        regularisation_cost_attract = self.regularisation_constant * (tf.nn.l2_loss(original_attract_examples_left - attract_examples_left) + tf.nn.l2_loss(original_attract_examples_right - attract_examples_right))
+        regularisation_cost_attract = self.regularisation_constant * (
+                tf.nn.l2_loss(original_attract_examples_left - attract_examples_left) + tf.nn.l2_loss(
+            original_attract_examples_right - attract_examples_right))
         self.attract_cost += regularisation_cost_attract
 
-        regularisation_cost_repel = self.regularisation_constant * (tf.nn.l2_loss(original_repel_examples_left - repel_examples_left) + tf.nn.l2_loss(original_repel_examples_right - repel_examples_right))
+        regularisation_cost_repel = self.regularisation_constant * (
+                tf.nn.l2_loss(original_repel_examples_left - repel_examples_left) + tf.nn.l2_loss(
+            original_repel_examples_right - repel_examples_right))
         self.repel_cost += regularisation_cost_repel
-    
+
         # Finally, we define the training step functions for both steps. 
 
         tvars = tf.trainable_variables()
         attract_grads = [tf.clip_by_value(grad, -2., 2.) for grad in tf.gradients(self.attract_cost, tvars)]
         repel_grads = [tf.clip_by_value(grad, -2., 2.) for grad in tf.gradients(self.repel_cost, tvars)]
 
-        attract_optimiser = tf.train.AdagradOptimizer(0.05) 
-        repel_optimiser = tf.train.AdagradOptimizer(0.05) 
-        
+        attract_optimiser = tf.train.AdagradOptimizer(0.05)
+        repel_optimiser = tf.train.AdagradOptimizer(0.05)
+
         self.attract_cost_step = attract_optimiser.apply_gradients(zip(attract_grads, tvars))
         self.repel_cost_step = repel_optimiser.apply_gradients(zip(repel_grads, tvars))
 
@@ -235,10 +259,10 @@ class ExperimentRun:
         This method loads/sets the hyperparameters of the procedure as specified in the paper.
         """
         self.attract_margin_value = self.config.getfloat("hyperparameters", "attract_margin")
-        self.repel_margin_value = self.config.getfloat("hyperparameters", "repel_margin") 
-        self.batch_size = int(self.config.getfloat("hyperparameters", "batch_size")) 
-        self.regularisation_constant_value    = self.config.getfloat("hyperparameters", "l2_reg_constant")
-        self.max_iter    = self.config.getfloat("hyperparameters", "max_iter")
+        self.repel_margin_value = self.config.getfloat("hyperparameters", "repel_margin")
+        self.batch_size = int(self.config.getfloat("hyperparameters", "batch_size"))
+        self.regularisation_constant_value = self.config.getfloat("hyperparameters", "l2_reg_constant")
+        self.max_iter = self.config.getfloat("hyperparameters", "max_iter")
         self.log_scores_over_time = self.config.get("experiment", "log_scores_over_time")
         self.print_simlex = self.config.get("experiment", "print_simlex")
 
@@ -252,12 +276,12 @@ class ExperimentRun:
         else:
             self.print_simlex = False
 
-
         print("\nExperiment hyperparameters (attract_margin, repel_margin, batch_size, l2_reg_constant, max_iter):", \
-               self.attract_margin_value, self.repel_margin_value, self.batch_size, self.regularisation_constant_value, self.max_iter)
+              self.attract_margin_value, self.repel_margin_value, self.batch_size, self.regularisation_constant_value,
+              self.max_iter)
 
-    
-    def extract_negative_examples(self, list_minibatch, attract_batch = True):
+
+    def extract_negative_examples(self, list_minibatch, attract_batch=True):
         """
         For each example in the minibatch, this method returns the closest vector which is not 
         in each words example pair. 
@@ -266,59 +290,77 @@ class ExperimentRun:
         list_of_representations = []
         list_of_indices = []
 
-        representations = self.sess.run([self.embedding_attract_left, self.embedding_attract_right], feed_dict={self.attract_examples: list_minibatch})
+        representations = self.sess.run([self.embedding_attract_left, self.embedding_attract_right],
+                                        feed_dict={self.attract_examples: list_minibatch})
 
         for idx, (example_left, example_right) in enumerate(list_minibatch):
-
             list_of_representations.append(representations[0][idx])
             list_of_representations.append(representations[1][idx])
 
             list_of_indices.append(example_left)
             list_of_indices.append(example_right)
 
-        condensed_distance_list = pdist(list_of_representations, 'cosine') 
-        square_distance_list = squareform(condensed_distance_list)   
+        condensed_distance_list = pdist(list_of_representations, 'cosine')
+        square_distance_list = squareform(condensed_distance_list)
 
-        if attract_batch: 
-            default_value = 2.0 # value to set for given attract/repel pair, so that it can not be found as closest or furthest away. 
+        if attract_batch:
+            default_value = 2.0  # value to set for given attract/repel pair, so that it can not be found as closest or furthest away.
         else:
-            default_value = 0.0 # for antonyms, we want the opposite value from the synonym one. Cosine Distance is [0,2]. 
+            default_value = 0.0  # for antonyms, we want the opposite value from the synonym one. Cosine Distance is [0,2].
 
         for i in range(len(square_distance_list)):
 
-            square_distance_list[i,i]=default_value 
-            
+            square_distance_list[i, i] = default_value
+
             if i % 2 == 0:
-                square_distance_list[i,i+1] = default_value 
+                square_distance_list[i, i + 1] = default_value
             else:
-                square_distance_list[i,i-1] = default_value
+                square_distance_list[i, i - 1] = default_value
 
         if attract_batch:
-            negative_example_indices = numpy.argmin(square_distance_list,axis=1) # for each of the 100 elements, finds the index which has the minimal cosine distance (i.e. most similar). 
+            negative_example_indices = numpy.argmin(square_distance_list,
+                                                    axis=1)  # for each of the 100 elements, finds the index which has the minimal cosine distance (i.e. most similar).
         else:
-            negative_example_indices = numpy.argmax(square_distance_list, axis=1) # for antonyms, find the least similar one. 
+            negative_example_indices = numpy.argmax(square_distance_list,
+                                                    axis=1)  # for antonyms, find the least similar one.
 
         negative_examples = []
 
         for idx in range(len(list_minibatch)):
-            
-            negative_example_left = list_of_indices[negative_example_indices[2 * idx]] 
+            negative_example_left = list_of_indices[negative_example_indices[2 * idx]]
             negative_example_right = list_of_indices[negative_example_indices[2 * idx + 1]]
-            
-            negative_examples.append((negative_example_left, negative_example_right))            
+
+            negative_examples.append((negative_example_left, negative_example_right))
 
         negative_examples = mix_sampling(list_minibatch, negative_examples)
 
         return negative_examples
 
 
+    def hypernymy_score_fct(self, pairs):
+        from scipy.special import expit as sigmoid
+
+        found_ix = []
+        hypo_vecs, hyper_vecs = [], []
+        for i, (hypo, hyper) in enumerate(pairs):
+            if hypo in self.word_vectors and hyper in self.word_vectors:
+                found_ix.append(i)
+                hypo_vecs.append(self.word_vectors[hypo])
+                hyper_vecs.append(self.word_vectors[hyper])
+
+        hypo_vecs = numpy.stack(hypo_vecs)
+        hyper_vecs = numpy.stack(hyper_vecs)
+        scores = (sigmoid(-hypo_vecs) * (numpy.log(sigmoid(-hyper_vecs)))).sum(axis=1)
+        return scores, found_ix
+
+
     def attract_repel(self):
         """
         This method repeatedly applies optimisation steps to fit the word vectors to the provided linguistic constraints. 
         """
-        
+
         current_iteration = 0
-        
+
         # Post-processing: remove synonym pairs which are deemed to be both synonyms and antonyms:
         for antonym_pair in self.antonyms:
             if antonym_pair in self.synonyms:
@@ -326,7 +368,7 @@ class ExperimentRun:
 
         self.synonyms = list(self.synonyms)
         self.antonyms = list(self.antonyms)
-        
+
         self.syn_count = len(self.synonyms)
         self.ant_count = len(self.antonyms)
 
@@ -345,12 +387,10 @@ class ExperimentRun:
         last_time = time.time()
 
         if self.log_scores_over_time:
-
             fwrite_simlex = open("results/simlex_scores.txt", "w")
             fwrite_wordsim = open("results/wordsim_scores.txt", "w")
 
         while current_iteration < self.max_iter:
-
             # how many attract/repel batches we've done in this epoch so far.
             antonym_counter = 0
             synonym_counter = 0
@@ -363,52 +403,65 @@ class ExperimentRun:
 
             # list of 0 where we run synonym batch, 1 where we run antonym batch
             list_of_batch_types = [0] * batches_per_epoch
-            list_of_batch_types[syn_batches:] = [1] * ant_batches # all antonym batches to 1
+            list_of_batch_types[syn_batches:] = [1] * ant_batches  # all antonym batches to 1
             random.shuffle(list_of_batch_types)
 
             if current_iteration == 0:
-                print("\nStarting epoch:", current_iteration+1, "\n")
+                print("\nStarting epoch:", current_iteration + 1, "\n")
             else:
-                print("\nStarting epoch:", current_iteration+1, "Last epoch took:", round(time.time() - last_time, 1), "seconds. \n")
+                print("\nStarting epoch:", current_iteration + 1, "Last epoch took:", round(time.time() - last_time, 1),
+                      "seconds. \n")
                 last_time = time.time()
-
 
             for batch_index in range(0, batches_per_epoch):
 
                 # we can Log SimLex / WordSim scores
-                if self.log_scores_over_time and (batch_index % (batches_per_epoch/20) == 0):
-
+                if self.log_scores_over_time and (batch_index % (batches_per_epoch / 20) == 0):
                     (simlex_score, wordsim_score) = self.create_vector_dictionary()
                     list_of_simlex.append(simlex_score)
                     list_of_wordsim.append(wordsim_score)
-                    
-                    print(len(list_of_simlex)+1, simlex_score, file=fwrite_simlex)
-                    print(len(list_of_simlex)+1, wordsim_score, file=fwrite_wordsim)
+
+                    print(len(list_of_simlex) + 1, simlex_score, file=fwrite_simlex)
+                    print(len(list_of_simlex) + 1, wordsim_score, file=fwrite_wordsim)
 
                 syn_or_ant_batch = list_of_batch_types[batch_index]
 
                 if syn_or_ant_batch == 0:
                     # do one synonymy batch:
 
-                    synonymy_examples = [self.synonyms[order_of_synonyms[x]] for x in range(synonym_counter * self.batch_size, (synonym_counter+1) * self.batch_size)]
+                    synonymy_examples = [self.synonyms[order_of_synonyms[x]] for x in
+                                         range(synonym_counter * self.batch_size,
+                                               (synonym_counter + 1) * self.batch_size)]
                     current_negatives = self.extract_negative_examples(synonymy_examples, attract_batch=True)
 
-                    self.sess.run([self.attract_cost_step], feed_dict={self.attract_examples: synonymy_examples, self.negative_examples_attract: current_negatives, \
-                                                                  self.attract_margin: self.attract_margin_value, self.regularisation_constant: self.regularisation_constant_value})
+                    self.sess.run([self.attract_cost_step], feed_dict={self.attract_examples: synonymy_examples,
+                                                                       self.negative_examples_attract: current_negatives, \
+                                                                       self.attract_margin: self.attract_margin_value,
+                                                                       self.regularisation_constant: self.regularisation_constant_value})
                     synonym_counter += 1
 
                 else:
 
-                    antonymy_examples = [self.antonyms[order_of_antonyms[x]] for x in range(antonym_counter * self.batch_size, (antonym_counter+1) * self.batch_size)]
+                    antonymy_examples = [self.antonyms[order_of_antonyms[x]] for x in
+                                         range(antonym_counter * self.batch_size,
+                                               (antonym_counter + 1) * self.batch_size)]
                     current_negatives = self.extract_negative_examples(antonymy_examples, attract_batch=False)
 
-                    self.sess.run([self.repel_cost_step], feed_dict={self.repel_examples: antonymy_examples, self.negative_examples_repel: current_negatives, \
-                                                                  self.repel_margin: self.repel_margin_value, self.regularisation_constant: self.regularisation_constant_value})
+                    self.sess.run([self.repel_cost_step], feed_dict={self.repel_examples: antonymy_examples,
+                                                                     self.negative_examples_repel: current_negatives, \
+                                                                     self.repel_margin: self.repel_margin_value,
+                                                                     self.regularisation_constant: self.regularisation_constant_value})
 
                     antonym_counter += 1
 
             current_iteration += 1
-            self.create_vector_dictionary() # whether to print SimLex score at the end of each epoch
+            self.create_vector_dictionary()  # whether to print SimLex score at the end of each epoch
+
+            if self.evaluate_hypernymy:
+                import hypeval
+                hyp_eval = hypeval.HyponomyEvaluator(self.hypernymy_dataset_path)
+                scores = hyp_eval.evaluate(self.score_fct, "Henderson.all", batched=True)
+                print("Scores:", scores)
 
 
     def create_vector_dictionary(self):
@@ -430,10 +483,9 @@ class ExperimentRun:
 
 
 def random_different_from(top_range, number_to_not_repeat):
-
-    result = random.randint(0, top_range-1)
+    result = random.randint(0, top_range - 1)
     while result == number_to_not_repeat:
-        result = random.randint(0, top_range-1)
+        result = random.randint(0, top_range - 1)
 
     return result
 
@@ -452,7 +504,7 @@ def mix_sampling(list_of_examples, negative_examples):
 
         if random.random() >= 0.5:
             new_left = list_of_examples[random_different_from(batch_size, idx)][random.randint(0, 1)]
-        
+
         if random.random() >= 0.5:
             new_right = list_of_examples[random_different_from(batch_size, idx)][random.randint(0, 1)]
 
@@ -466,7 +518,7 @@ def normalise_word_vectors(word_vectors, norm=1.0):
     This method normalises the collection of word vectors provided in the word_vectors dictionary.
     """
     for word in word_vectors:
-        word_vectors[word] /= math.sqrt((word_vectors[word]**2).sum() + 1e-6)
+        word_vectors[word] /= math.sqrt((word_vectors[word] ** 2).sum() + 1e-6)
         word_vectors[word] = word_vectors[word] * norm
     return word_vectors
 
@@ -480,11 +532,10 @@ def load_word_vectors(file_destination):
     word_dictionary = {}
 
     try:
-        
-        f = codecs.open(file_destination, 'r', 'utf-8') 
+
+        f = codecs.open(file_destination, 'r', 'utf-8')
 
         for line in f:
-
             line = line.split(" ", 1)
             key = line[0].lower()
             word_dictionary[key] = numpy.fromstring(line[1], dtype="float32", sep=" ")
@@ -519,13 +570,14 @@ def simlex_analysis(word_vectors, language="english", source="simlex", add_prefi
     """
     pair_list = []
     if source == "simlex":
-        fread_simlex=codecs.open("evaluation/simlex-" + language + ".txt", 'r', 'utf-8')
+        fread_simlex = codecs.open("evaluation/simlex-" + language + ".txt", 'r', 'utf-8')
     elif source == "simlex-old":
-        fread_simlex=codecs.open("evaluation/simlex-english-old.txt", 'r', 'utf-8')
+        fread_simlex = codecs.open("evaluation/simlex-english-old.txt", 'r', 'utf-8')
     elif source == "simverb":
-        fread_simlex=codecs.open("evaluation/simverb.txt", 'r', 'utf-8')
+        fread_simlex = codecs.open("evaluation/simverb.txt", 'r', 'utf-8')
     elif source == "wordsim":
-        fread_simlex=codecs.open("evaluation/ws-353/wordsim353-" + language + ".txt", 'r', 'utf-8') # specify english, english-rel, etc.
+        fread_simlex = codecs.open("evaluation/ws-353/wordsim353-" + language + ".txt", 'r',
+                                   'utf-8')  # specify english, english-rel, etc.
 
     # needed for prefixes if we are adding these.
     lp_map = {}
@@ -551,7 +603,7 @@ def simlex_analysis(word_vectors, language="english", source="simlex", add_prefi
                 word_j = lp_map[language] + word_j
 
             if word_i in word_vectors and word_j in word_vectors:
-                pair_list.append( ((word_i, word_j), score) )
+                pair_list.append(((word_i, word_j), score))
             else:
                 pass
 
@@ -567,10 +619,9 @@ def simlex_analysis(word_vectors, language="english", source="simlex", add_prefi
     extracted_list = []
     extracted_scores = {}
 
-    for (x,y) in pair_list:
-
+    for (x, y) in pair_list:
         (word_i, word_j) = x
-        current_distance = distance(word_vectors[word_i], word_vectors[word_j]) 
+        current_distance = distance(word_vectors[word_i], word_vectors[word_j])
         extracted_scores[(word_i, word_j)] = current_distance
         extracted_list.append(((word_i, word_j), current_distance))
 
@@ -601,11 +652,10 @@ def distance(v1, v2, normalised_vectors=False):
     if normalised_vectors:
         return 1 - dot(v1, v2)
     else:
-        return 1 - dot(v1, v2) / ( norm(v1) * norm(v2) )
+        return 1 - dot(v1, v2) / (norm(v1) * norm(v2))
 
 
 def simlex_scores(word_vectors, print_simlex=True):
-
     for language in ["english", "german", "italian", "russian", "croatian", "hebrew"]:
 
         simlex_score, simlex_coverage = simlex_analysis(word_vectors, language)
@@ -622,17 +672,18 @@ def simlex_scores(word_vectors, print_simlex=True):
         if simlex_coverage > 0:
 
             if print_simlex:
-    
+
                 if language == "english":
 
                     simlex_old, cov_old = simlex_analysis(word_vectors, language, source="simlex-old")
 
-                    print("SimLex score for", language, "is:", simlex_score, "Original SimLex score is:", simlex_old, "coverage:", simlex_coverage, "/ 999")
+                    print("SimLex score for", language, "is:", simlex_score, "Original SimLex score is:", simlex_old,
+                          "coverage:", simlex_coverage, "/ 999")
                     print("SimVerb score for", language, "is:", simverb_score, "coverage:", simverb_coverage, "/ 3500")
                     print("WordSim score for", language, "is:", ws_score, "coverage:", ws_coverage, "/ 353\n")
 
                 elif language in ["italian", "german", "russian"]:
-                    
+
                     print("SimLex score for", language, "is:", simlex_score, "coverage:", simlex_coverage, "/ 999")
                     print("WordSim score for", language, "is:", ws_score, "coverage:", ws_coverage, "/ 353\n")
 
@@ -655,15 +706,15 @@ def run_experiment(config_filepath):
     results directory.
     """
     current_experiment = ExperimentRun(config_filepath)
-    
-    current_experiment.attract_repel() 
-    
+
+    current_experiment.attract_repel()
+
     print("\nSimLex score (Spearman's rho coefficient) of the final vectors is:")
-           
+
     simlex_scores(current_experiment.word_vectors), "\n"
 
     os.system("mkdir -p results")
-    
+
     print_word_vectors(current_experiment.word_vectors, current_experiment.output_filepath)
 
 
@@ -681,6 +732,5 @@ def main():
     run_experiment(config_filepath)
 
 
-if __name__=='__main__':
+if __name__ == '__main__':
     main()
-
