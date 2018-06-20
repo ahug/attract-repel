@@ -13,7 +13,6 @@ import codecs
 from scipy.stats import spearmanr
 import tensorflow as tf
 import traceback
-import hypeval
 
 from scipy.spatial.distance import pdist
 from scipy.spatial.distance import squareform
@@ -42,6 +41,7 @@ class ExperimentRun:
             print("Couldn't read config file from", config_filepath)
             return None
 
+        sys.path.append(self.config.get("experiment", "hypeval_path"))
         self.evaluate_hypernymy = self.config.getboolean("experiment", "evaluate_hypernymy")
         self.hypernymy_dataset_path = self.config.get("experiment", "hypernymy_dataset_path")
 
@@ -125,6 +125,7 @@ class ExperimentRun:
         """
         self.attract_examples = tf.placeholder(tf.int32, [None, 2])  # each element is the position of word vector.
         self.repel_examples = tf.placeholder(tf.int32, [None, 2])  # each element is again the position of word vector.
+        
 
         self.negative_examples_attract = tf.placeholder(tf.int32, [None, 2])
         self.negative_examples_repel = tf.placeholder(tf.int32, [None, 2])
@@ -460,7 +461,7 @@ class ExperimentRun:
             if self.evaluate_hypernymy:
                 import hypeval
                 hyp_eval = hypeval.HyponomyEvaluator(self.hypernymy_dataset_path)
-                scores = hyp_eval.evaluate(self.score_fct, "Henderson.all", batched=True)
+                scores = hyp_eval.evaluate(self.hypernymy_score_fct, "Henderson.all", batched=True)
                 print("Scores:", scores)
 
 
