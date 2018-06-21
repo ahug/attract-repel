@@ -74,9 +74,11 @@ class ExperimentRun:
         # load list of filenames for synonyms and antonyms. 
         synonym_list = self.config.get("data", "synonyms").replace("[", "").replace("]", "").replace(" ", "").split(",")
         antonym_list = self.config.get("data", "antonyms").replace("[", "").replace("]", "").replace(" ", "").split(",")
+        hypernyms_path = self.config.get("data", "hypernyms")
 
         self.synonyms = set()
         self.antonyms = set()
+        self.hypernyms = set()
 
         if synonym_list != "":
             # and we then have all the information to load all linguistic constraints
@@ -92,6 +94,10 @@ class ExperimentRun:
                     self.antonyms = self.antonyms | self.load_constraints(ant_filepath)
         else:
             self.antonyms = set()
+
+        with open(hypernyms_path, "r") as fin:
+            hypernym_list = [tuple(l.strip().split("\t")) for l in fin]
+            self.hypernyms = set(hypernym_list)
 
         # finally, load the experiment hyperparameters:
         self.load_experiment_hyperparameters()
@@ -125,20 +131,37 @@ class ExperimentRun:
         """
         self.attract_examples = tf.placeholder(tf.int32, [None, 2])  # each element is the position of word vector.
         self.repel_examples = tf.placeholder(tf.int32, [None, 2])  # each element is again the position of word vector.
-        
+        self.entailment_examples = tf.placeholder(tf.int32, [None, 2])
 
         self.negative_examples_attract = tf.placeholder(tf.int32, [None, 2])
         self.negative_examples_repel = tf.placeholder(tf.int32, [None, 2])
 
         self.attract_margin = tf.placeholder("float")
         self.repel_margin = tf.placeholder("float")
-        self.regularisation_constant = tf.placeholder("float")
+        self.regularisation_constant = tf.placeholder("float", name="regularisation_constant")
 
         # Initial (distributional) vectors. Needed for L2 regularisation.         
         self.W_init = tf.constant(numpy_embedding, name="W_init")
 
         # Variable storing the updated word vectors. 
         self.W_dynamic = tf.Variable(numpy_embedding, name="W_dynamic")
+
+        # Entailment Cost Function
+        entailment_examples_left = tf.nn.embedding_lookup(self.W_dynamic, self.entailment_examples[:, 0])
+        entailment_examples_right = tf.nn.embedding_lookup(self.W_dynamic, self.entailment_examples[:, 1])
+
+        original_entailment_examples_left = tf.nn.embedding_lookup(self.W_init, self.entailment_examples[:, 0])
+        original_entailment_examples_right = tf.nn.embedding_lookup(self.W_init, self.entailment_examples[:, 1])
+
+        self.entailment_cost = - tf.reduce_sum(
+            tf.multiply(tf.sigmoid(-entailment_examples_left), tf.log(tf.sigmoid(-entailment_examples_right))),
+            1)  # minus sign!
+
+        regularisation_cost_entailment = self.regularisation_constant * (
+                tf.nn.l2_loss(original_entailment_examples_left - entailment_examples_left) + tf.nn.l2_loss(
+            original_entailment_examples_right - entailment_examples_right))
+
+        self.entailment_cost += regularisation_cost_entailment
 
         # Attract Cost Function:
 
@@ -224,12 +247,15 @@ class ExperimentRun:
         tvars = tf.trainable_variables()
         attract_grads = [tf.clip_by_value(grad, -2., 2.) for grad in tf.gradients(self.attract_cost, tvars)]
         repel_grads = [tf.clip_by_value(grad, -2., 2.) for grad in tf.gradients(self.repel_cost, tvars)]
+        entailment_grads = [tf.clip_by_value(grad, -2., 2.) for grad in tf.gradients(self.entailment_cost, tvars)]
 
         attract_optimiser = tf.train.AdagradOptimizer(0.05)
         repel_optimiser = tf.train.AdagradOptimizer(0.05)
+        entailment_optimiser = tf.train.AdagradOptimizer(0.05)
 
         self.attract_cost_step = attract_optimiser.apply_gradients(zip(attract_grads, tvars))
         self.repel_cost_step = repel_optimiser.apply_gradients(zip(repel_grads, tvars))
+        self.entailment_cost_step = entailment_optimiser.apply_gradients(zip(entailment_grads, tvars))
 
         # return the handles for loading vectors from the TensorFlow embeddings:
         return attract_examples_left, attract_examples_right, repel_examples_left, repel_examples_right
@@ -369,9 +395,11 @@ class ExperimentRun:
 
         self.synonyms = list(self.synonyms)
         self.antonyms = list(self.antonyms)
+        self.hypernyms = list(self.hypernyms)
 
         self.syn_count = len(self.synonyms)
         self.ant_count = len(self.antonyms)
+        self.hyp_count = len(self.hypernyms)
 
         print("\nAntonym pairs:", len(self.antonyms), "Synonym pairs:", len(self.synonyms))
 
@@ -380,8 +408,9 @@ class ExperimentRun:
 
         syn_batches = int(self.syn_count / self.batch_size)
         ant_batches = int(self.ant_count / self.batch_size)
+        hypernym_batches = int(self.hyp_count / self.batch_size)
 
-        batches_per_epoch = syn_batches + ant_batches
+        batches_per_epoch = syn_batches + ant_batches + hypernym_batches
 
         print("\nRunning the optimisation procedure for", self.max_iter, "iterations...")
 
@@ -395,16 +424,20 @@ class ExperimentRun:
             # how many attract/repel batches we've done in this epoch so far.
             antonym_counter = 0
             synonym_counter = 0
+            hypernym_counter = 0
 
             order_of_synonyms = list(range(0, self.syn_count))
             order_of_antonyms = list(range(0, self.ant_count))
+            order_of_hypernyms = list(range(0, self.hyp_count))
 
             random.shuffle(order_of_synonyms)
             random.shuffle(order_of_antonyms)
+            random.shuffle(order_of_hypernyms)
 
             # list of 0 where we run synonym batch, 1 where we run antonym batch
             list_of_batch_types = [0] * batches_per_epoch
-            list_of_batch_types[syn_batches:] = [1] * ant_batches  # all antonym batches to 1
+            list_of_batch_types[syn_batches:(syn_batches + ant_batches)] = [1] * ant_batches  # all antonym batches to 1
+            list_of_batch_types[(syn_batches + ant_batches):] = [2] * hypernym_batches
             random.shuffle(list_of_batch_types)
 
             if current_iteration == 0:
@@ -425,9 +458,9 @@ class ExperimentRun:
                     print(len(list_of_simlex) + 1, simlex_score, file=fwrite_simlex)
                     print(len(list_of_simlex) + 1, wordsim_score, file=fwrite_wordsim)
 
-                syn_or_ant_batch = list_of_batch_types[batch_index]
+                batch_type = list_of_batch_types[batch_index]
 
-                if syn_or_ant_batch == 0:
+                if batch_type == 0:
                     # do one synonymy batch:
 
                     synonymy_examples = [self.synonyms[order_of_synonyms[x]] for x in
@@ -441,8 +474,8 @@ class ExperimentRun:
                                                                        self.regularisation_constant: self.regularisation_constant_value})
                     synonym_counter += 1
 
-                else:
-
+                elif batch_type == 1:
+                    # antonymy batch
                     antonymy_examples = [self.antonyms[order_of_antonyms[x]] for x in
                                          range(antonym_counter * self.batch_size,
                                                (antonym_counter + 1) * self.batch_size)]
@@ -452,8 +485,18 @@ class ExperimentRun:
                                                                      self.negative_examples_repel: current_negatives, \
                                                                      self.repel_margin: self.repel_margin_value,
                                                                      self.regularisation_constant: self.regularisation_constant_value})
-
                     antonym_counter += 1
+
+                elif batch_type == 2:
+                    # hypernymy batch
+                    hypernymy_examples = [self.hypernyms[order_of_hypernyms[x]] for x in
+                                          range(hypernym_counter * self.batch_size,
+                                                (hypernym_counter + 1) * self.batch_size)]
+                    hypernymy_examples = [[self.vocab_index[l[0]], self.vocab_index[l[1]]] for l in hypernymy_examples]
+
+                    self.sess.run([self.entailment_cost_step], feed_dict={self.entailment_examples: hypernymy_examples,
+                                                                          self.regularisation_constant: self.regularisation_constant_value})
+                    hypernym_counter += 1
 
             current_iteration += 1
             self.create_vector_dictionary()  # whether to print SimLex score at the end of each epoch
@@ -461,7 +504,7 @@ class ExperimentRun:
             if self.evaluate_hypernymy:
                 import hypeval
                 hyp_eval = hypeval.HyponomyEvaluator(self.hypernymy_dataset_path)
-                scores = hyp_eval.evaluate(self.hypernymy_score_fct, "Henderson.all", batched=True)
+                scores = hyp_eval.evaluate(self.hypernymy_score_fct, "BIBLESS.all", batched=True)
                 print("Scores:", scores)
 
 
