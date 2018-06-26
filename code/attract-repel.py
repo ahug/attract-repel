@@ -154,8 +154,10 @@ class ExperimentRun:
         original_entailment_examples_right = tf.nn.embedding_lookup(self.W_init, self.entailment_examples[:, 1])
 
         self.entailment_cost = - tf.reduce_sum(
-            tf.multiply(tf.sigmoid(-entailment_examples_left), tf.log(tf.sigmoid(-entailment_examples_right))),
-            1)  # minus sign!
+            tf.multiply(tf.sigmoid(-entailment_examples_left), tf.log(tf.sigmoid(-entailment_examples_right))), 1)
+        # punish the other direction as well
+        self.entailment_cost += tf.reduce_sum(
+            tf.multiply(tf.sigmoid(-entailment_examples_right), tf.log(tf.sigmoid(-entailment_examples_left))), 1)
 
         regularisation_cost_entailment = self.regularisation_constant * (
                 tf.nn.l2_loss(original_entailment_examples_left - entailment_examples_left) + tf.nn.l2_loss(
